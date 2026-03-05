@@ -1,8 +1,9 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from database import messages_collection
+from database import messages_collection, users_collection
 from datetime import datetime
 from jose import jwt, JWTError
+from bson import ObjectId
 import os
 from dotenv import load_dotenv
 
@@ -13,6 +14,7 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 security = HTTPBearer()
 active_connections: dict = {}
+
 
 def verify_token(token: str):
     try:
@@ -73,12 +75,51 @@ def get_messages(
     return result
 
 
+# ✅ GET RECENT CHATS
+@router.get("/recent")
+def get_recent_chats(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    user_id = verify_token(credentials.credentials)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    pipeline = [
+        {"$match": {"$or": [{"from_user": user_id}, {"to_user": user_id}]}},
+        {"$sort": {"timestamp": -1}},
+        {"$group": {
+            "_id": {
+                "$cond": [{"$eq": ["$from_user", user_id]}, "$to_user", "$from_user"]
+            },
+            "last_message": {"$first": "$text"},
+            "timestamp": {"$first": "$timestamp"}
+        }},
+        {"$sort": {"timestamp": -1}}
+    ]
+
+    results = list(messages_collection.aggregate(pipeline))
+    chats = []
+    for r in results:
+        other_id = r["_id"]
+        try:
+            user = users_collection.find_one({"_id": ObjectId(other_id)})
+            if user:
+                chats.append({
+                    "user_id": other_id,
+                    "name": user["name"],
+                    "email": user["email"],
+                    "last_message": r["last_message"],
+                    "time": r["timestamp"].strftime("%I:%M %p") if r["timestamp"] else ""
+                })
+        except Exception:
+            pass
+    return chats
+
+
 # ✅ WEBSOCKET
 @router.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await websocket.accept()
     active_connections[user_id] = websocket
-    print(f"User {user_id} connected")
+    print(f"User {user_id} connected via WebSocket")
     try:
         while True:
             data = await websocket.receive_json()
